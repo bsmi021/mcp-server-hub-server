@@ -1,0 +1,8 @@
+{
+    "mcpServers": {},
+    "settings": {
+        "logLevel": "info",
+        "wsPort": 8081,
+        "ssePort": null
+    }
+}

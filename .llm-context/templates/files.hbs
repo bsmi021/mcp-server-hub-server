@@ -1,0 +1,11 @@
+{{#each files}}
+### 📄 {{path}}
+{{#if metadata.analysis}}
+> 📊 Complexity: {{metadata.analysis.complexity}} | 🔗 Dependencies: {{metadata.analysis.imports.length}}
+{{/if}}
+
+```{{language}}
+{{{content}}}
+```
+
+{{/each}}

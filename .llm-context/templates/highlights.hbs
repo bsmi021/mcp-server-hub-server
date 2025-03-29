@@ -1,0 +1,11 @@
+{{#each highlights}}
+### 🔍 {{path}}
+{{#if metadata.analysis}}
+> 📊 Complexity: {{metadata.analysis.complexity}}
+{{/if}}
+
+```
+{{{outline}}}
+```
+
+{{/each}}
