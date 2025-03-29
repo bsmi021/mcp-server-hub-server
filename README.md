@@ -24,24 +24,33 @@ The system consists of two main components within this repository:
 **Workflow Diagram:**
 
 ```mermaid
-graph LR
-    subgraph LLM Client Application (e.g., Cline)
-        LLM_Client -- STDIO --> GatewayClientProxy;
+flowchart LR
+    subgraph "User Machine"
+        LLM_Client1["LLM Client (e.g., Cline)"]
+        LLM_Client2["LLM Client (e.g., Cursor)"]
+        
+        subgraph "Gateway Client Process"
+            GatewayClient["Gateway Client App"]
+        end
+        
+        subgraph "Gateway Server Process"
+            GatewayServer["Gateway Server (mcp-server-hub-server)"]
+            MCPServer1["MCP Server (e.g., Thought)"]
+            MCPServer2["MCP Server (e.g., File Ops)"]
+            ConfigFile["mcp_hub_config.json in AppData"]
+        end
     end
-
-    subgraph Gateway Client Process (Started by LLM Client)
-        GatewayClientProxy[Gateway Client (client.ts)] -- WebSocket --> GatewayServerWS;
-    end
-
-    subgraph Gateway Server Process (npm start)
-        GatewayServerWS[Gateway Server (server.ts)];
-        GatewayServerWS -- Manages --> ManagedMCPServer1[Managed Server 1];
-        GatewayServerWS -- Manages --> ManagedMCPServerN[Managed Server N];
-        GatewayServerWS -- Reads --> ConfigFile[dist/mcp_hub_config.json];
-    end
-
-    style GatewayClientProxy fill:#f9f,stroke:#333,stroke-width:2px;
-    style GatewayServerWS fill:#ccf,stroke:#333,stroke-width:2px;
+    
+    LLM_Client1 -- "STDIO/SSE" --> GatewayClient
+    LLM_Client2 -- "STDIO/SSE" --> GatewayClient
+    GatewayClient -- "WebSocket" --> GatewayServer
+    GatewayServer -- "Manages" --> MCPServer1
+    GatewayServer -- "Manages" --> MCPServer2
+    GatewayServer -- "Reads" --> ConfigFile
+    GatewayClient -- "Checks/Starts" --> GatewayServer
+    
+    style GatewayClient fill:#f9f,stroke:#333,stroke-width:2px
+    style GatewayServer fill:#ccf,stroke:#333,stroke-width:2px
 ```
 
 ## Getting Started

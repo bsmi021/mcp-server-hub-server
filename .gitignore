@@ -130,4 +130,6 @@ dist
 .pnp.*
 
 docs/
+.llm-context/
+.llm-context/*
 
