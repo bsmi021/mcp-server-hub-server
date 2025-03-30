@@ -36,13 +36,14 @@ async function main() {
 
         // 3. Initialize Managers
         serverManager = new ServerManager(configManager);
-        toolRegistry = new ToolRegistry(serverManager); // ToolRegistry listens to ServerManager
+        // Pass configManager to ToolRegistry constructor
+        toolRegistry = new ToolRegistry(serverManager, configManager);
 
         // Initialize server instances (creates map, doesn't spawn yet)
         serverManager.initializeServers();
 
         // 4. Initialize Interfaces
-        stdioInterface = new StdioInterface(toolRegistry, serverManager);
+        stdioInterface = new StdioInterface(toolRegistry, serverManager, configManager); // Pass configManager
         // sseInterface = new SseInterface(toolRegistry, serverManager, configManager); // Comment out or remove SSE
         webSocketInterface = new WebSocketInterface(toolRegistry, serverManager, configManager); // Initialize WebSocketInterface
 

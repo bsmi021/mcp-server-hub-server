@@ -5,6 +5,7 @@ import { ServerManager } from '../managers/ServerManager.js';
 import { ToolRegistry } from '../managers/ToolRegistry.js';
 import { logger } from '../utils/logger.js';
 import { ServerStatus, ServerStatusChangeListener } from '../types/serverTypes.js';
+import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js'; // Added import
 
 // Define the structure for messages exchanged over WebSocket
 interface WebSocketMessage {
@@ -216,13 +217,19 @@ export class WebSocketInterface extends EventEmitter {
         }
 
         try {
-            // ToolRegistry's callTool should handle finding the right server and forwarding
+            // Delegate directly to ToolRegistry, which handles routing and errors
             const result = await this.toolRegistry.callTool(params.name, params.arguments);
             this.sendResponse(ws, requestId, result);
         } catch (error: any) {
-            logger.error(`Error calling tool "${params.name}" via WS: ${error.message}`, error);
-            // TODO: Map internal errors (like MethodNotFound) to appropriate JSON-RPC error codes
-            this.sendError(ws, requestId, -32000, 'Server error', `Failed to call tool "${params.name}": ${error.message}`);
+            logger.error(`WS: Error processing CallTool request for ${params.name}: ${error.message}`, error);
+            // Re-throw MCP errors directly, wrap others if necessary
+            if (error instanceof McpError) {
+                // Map MCP error codes to JSON-RPC codes if needed, or use custom range
+                this.sendError(ws, requestId, error.code, error.message, error.data);
+            } else {
+                // Convert other errors to InternalError for the client
+                this.sendError(ws, requestId, -32603, 'Internal error', `Failed to execute tool "${params.name}": ${error.message}`);
+            }
         }
     }
 

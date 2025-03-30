@@ -192,46 +192,18 @@ export class SseInterface {
             const toolArgs = request.params.arguments;
             logger.debug(`SSE: Received CallTool request for: ${gatewayToolName}`);
 
-            const toolDef = this.toolRegistry.getTool(gatewayToolName);
-            if (!toolDef) {
-                throw new McpError(ErrorCode.MethodNotFound, `Tool '${gatewayToolName}' not found.`);
-            }
-            const targetServerId = toolDef.serverId;
-            const targetServerInstance = this.serverManager.getServerInstance(targetServerId);
-            if (!targetServerInstance || targetServerInstance.status !== 'running' || !targetServerInstance.process) {
-                throw new McpError(ErrorCode.InternalError, `Target server '${targetServerId}' is not available.`);
-            }
-
-            // --- Forward request to target server (identical logic) ---
-            let targetClient: McpClient | null = null;
-            let targetTransport: StdioClientTransport | null = null;
             try {
-                const transportParams: StdioServerParameters = {
-                    command: targetServerInstance.config.command,
-                    args: targetServerInstance.config.args,
-                    env: targetServerInstance.config.env,
-                    cwd: targetServerInstance.config.workingDir,
-                };
-                targetTransport = new StdioClientTransport(transportParams);
-                const clientMetadata = { name: 'mcp-gateway-sse-fwd', version: '0.0.1' };
-                // Corrected: Instantiate client with empty options, then connect transport
-                targetClient = new McpClient(clientMetadata, {});
-                await targetClient.connect(targetTransport); // Explicitly connect
-
-                const targetResponse = await targetClient.callTool(
-                    { name: toolDef.name, arguments: toolArgs },
-                    undefined,
-                    { timeout: CALL_TOOL_TIMEOUT_MS }
-                );
-                return targetResponse;
+                // Delegate directly to ToolRegistry, which handles routing and errors
+                const result = await this.toolRegistry.callTool(gatewayToolName, toolArgs);
+                return result;
             } catch (error: any) {
-                logger.error(`SSE: Error forwarding CallTool request to ${targetServerId}: ${error.message}`, error);
-                if (error instanceof McpError) throw error;
-                throw new McpError(ErrorCode.InternalError, `Failed to call tool on target server: ${error.message}`);
-            } finally {
-                if (targetClient) {
-                    await targetClient.close().catch(err => logger.warn(`SSE: Error closing target client for ${targetServerId}: ${err.message}`));
+                logger.error(`SSE: Error processing CallTool request for ${gatewayToolName}: ${error.message}`, error);
+                // Re-throw MCP errors directly, wrap others if necessary
+                if (error instanceof McpError) {
+                    throw error;
                 }
+                // Convert other errors to InternalError for the client
+                throw new McpError(ErrorCode.InternalError, `Failed to execute tool "${gatewayToolName}": ${error.message}`);
             }
         });
 

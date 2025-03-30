@@ -28,14 +28,22 @@ const CALL_TOOL_TIMEOUT_MS = 30000; // 30 seconds
  * Implements the STDIO gateway interface for MCP clients.
  * Listens on stdin/stdout and routes requests to managed servers.
  */
+import { ConfigurationManager } from '../config/ConfigurationManager.js'; // Import ConfigManager
+
+/**
+ * Implements the STDIO gateway interface for MCP clients.
+ * Listens on stdin/stdout and routes requests to managed servers.
+ */
 export class StdioInterface {
     private mcpServer: McpServer;
     private toolRegistry: ToolRegistry;
     private serverManager: ServerManager;
+    private configManager: ConfigurationManager; // Add configManager property
 
-    constructor(toolRegistry: ToolRegistry, serverManager: ServerManager) {
+    constructor(toolRegistry: ToolRegistry, serverManager: ServerManager, configManager: ConfigurationManager) { // Add configManager param
         this.toolRegistry = toolRegistry;
         this.serverManager = serverManager;
+        this.configManager = configManager; // Assign configManager
 
         const serverOptions: ServerOptions = {
             // Explicitly enable the 'tools' capability for this server instance
@@ -81,69 +89,23 @@ export class StdioInterface {
         this.mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
             const gatewayToolName = request.params.name;
             const toolArgs = request.params.arguments;
-            logger.debug(`Received CallTool request for: ${gatewayToolName}`);
+            logger.debug(`STDIO: Received CallTool request for: ${gatewayToolName}`);
 
-            const toolDef = this.toolRegistry.getTool(gatewayToolName);
-            if (!toolDef) {
-                logger.warn(`Tool not found: ${gatewayToolName}`);
-                throw new McpError(ErrorCode.MethodNotFound, `Tool '${gatewayToolName}' not found.`);
-            }
+            // Get config snapshot at the time of request
+            const configSnapshot = this.configManager.getCurrentConfig(); // Need to inject configManager
 
-            const targetServerId = toolDef.serverId;
-            const targetServerInstance = this.serverManager.getServerInstance(targetServerId);
-
-            if (!targetServerInstance || targetServerInstance.status !== 'running' || !targetServerInstance.process) {
-                logger.error(`Target server ${targetServerId} for tool ${gatewayToolName} is not running or process is missing.`);
-                throw new McpError(ErrorCode.InternalError, `Target server '${targetServerId}' is not available.`);
-            }
-
-            // --- Forward request to target server ---
-            let targetClient: McpClient | null = null;
-            let targetTransport: StdioClientTransport | null = null;
             try {
-                // Create transport parameters based on StdioServerParameters definition
-                const transportParams: StdioServerParameters = {
-                    command: targetServerInstance.config.command,
-                    args: targetServerInstance.config.args,
-                    env: targetServerInstance.config.env,
-                    cwd: targetServerInstance.config.workingDir,
-                };
-                targetTransport = new StdioClientTransport(transportParams);
-
-                // Create Client with metadata and empty options
-                const clientMetadata = { name: 'mcp-gateway-stdio-fwd', version: '0.0.1' };
-                targetClient = new McpClient(clientMetadata, {}); // Pass empty options
-
-                // Explicitly connect the transport. This triggers initialization.
-                await targetClient.connect(targetTransport);
-
-                logger.debug(`Forwarding CallTool request for '${toolDef.name}' to server ${targetServerId}`);
-
-                // Use the original tool name when calling the target server
-                // Use the client's helper method callTool
-                const targetResponse = await targetClient.callTool(
-                    { name: toolDef.name, arguments: toolArgs },
-                    undefined, // Pass undefined for resultSchema to use default
-                    { timeout: CALL_TOOL_TIMEOUT_MS }
-                );
-
-                logger.debug(`Received response from target server ${targetServerId} for ${gatewayToolName}`);
-                // Return the response directly. Type safety relies on SDK callTool helper return type.
-                return targetResponse;
-
+                // Delegate directly to ToolRegistry, passing the snapshot
+                const result = await this.toolRegistry.callTool(gatewayToolName, toolArgs, configSnapshot);
+                return result;
             } catch (error: any) {
-                logger.error(`Error forwarding CallTool request to ${targetServerId}: ${error.message}`, error); // Log the full error
+                logger.error(`STDIO: Error processing CallTool request for ${gatewayToolName}: ${error.message}`, error);
+                // Re-throw MCP errors directly, wrap others if necessary
                 if (error instanceof McpError) {
-                    throw error; // Re-throw MCP errors directly
+                    throw error;
                 }
-                // Map other errors to InternalError
-                throw new McpError(ErrorCode.InternalError, `Failed to call tool on target server: ${error.message}`);
-            } finally {
-                // Clean up the temporary client connection to the target server
-                if (targetClient) {
-                    // Corrected: close takes no arguments
-                    await targetClient.close().catch(err => logger.warn(`Error closing target client for ${targetServerId}: ${err.message}`));
-                }
+                // Convert other errors to InternalError for the client
+                throw new McpError(ErrorCode.InternalError, `Failed to execute tool "${gatewayToolName}": ${error.message}`);
             }
         });
 

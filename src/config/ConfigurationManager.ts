@@ -317,6 +317,17 @@ export class ConfigurationManager extends EventEmitter {
     }
 
     /**
+     * Gets the currently loaded and processed configuration object.
+     * Returns null if the configuration has not been successfully loaded yet.
+     * Use getters like `getServerConfig` or `getGatewaySettings` for type safety and guaranteed structure.
+     * @returns The current Config object or null.
+     */
+    public getCurrentConfig(): Config | null {
+        // No ensureConfigLoaded() check here, as it might be called before initial load completes
+        return this.config;
+    }
+
+    /**
      * Closes the file watcher gracefully. Should be called on application shutdown.
      */
     public async closeWatcher(): Promise<void> {
