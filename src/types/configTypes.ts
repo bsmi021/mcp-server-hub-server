@@ -1,87 +1,41 @@
-/**
- * Defines the structure for the main configuration object loaded from the JSON file.
- */
-export interface Config {
-    /**
-     * A map where keys are unique server identifiers (strings) and values
-     * are the configuration objects for each MCP server to be managed.
-     */
-    mcpServers: {
-        [serverId: string]: ServerConfig;
-    };
-    /**
-     * Optional settings specific to the MCP Gateway Server itself.
-     */
-    settings?: GatewaySettings;
-}
+import { z } from 'zod';
 
-/**
- * Defines the configuration for a single MCP server instance managed by the gateway.
- */
-export interface ServerConfig {
-    /**
-     * The command or executable to run to start the server (e.g., 'node', 'python', '/path/to/executable').
-     */
-    command: string;
-    /**
-     * An optional array of string arguments to pass to the command.
-     */
-    args?: string[];
-    /**
-     * An optional map of environment variables (key-value pairs) to set for the server process.
-     * Supports basic environment variable substitution using ${VAR_NAME} syntax.
-     */
-    env?: Record<string, string>;
-    /**
-     * An optional working directory path where the server command should be executed.
-     * If not provided, defaults to the gateway's working directory.
-     */
-    workingDir?: string;
-    /**
-     * Optional flag indicating whether the gateway should automatically restart
-     * this server if it crashes or exits unexpectedly. Defaults to false.
-     */
-    autoRestart?: boolean;
-    /**
-     * Optional maximum number of restart attempts within a short time frame
-     * if autoRestart is true. Helps prevent rapid restart loops. Defaults to 3.
-     */
-    maxRestarts?: number; // Consider adding a time window for this later
-}
-
-/**
- * Defines optional settings for the MCP Gateway Server.
- */
-export interface GatewaySettings {
-    /**
-     * The port number on which the gateway should listen for Server-Sent Events (SSE) connections.
-     * Required if SSE interface is enabled.
-     */
-    ssePort?: number;
-    /**
-     * The host address for the SSE server. Defaults to 'localhost'.
-     */
-    sseHost?: string;
-    /**
-     * The path for the SSE endpoint. Defaults to '/events'.
-     */
-    ssePath?: string;
-    /**
-     * The port number on which the gateway should listen for WebSocket connections.
-     * Required if WebSocket interface is enabled.
-     */
-    wsPort?: number;
-    /**
-     * The minimum log level for the gateway's logger.
-     * Options: 'error', 'warn', 'info', 'debug'. Defaults to 'info'.
-     */
-    logLevel?: 'error' | 'warn' | 'info' | 'debug';
-}
-
-/**
- * Represents the result of configuration validation.
- */
+// Keep this interface as it's not derived from Zod
 export interface ValidationResult {
     isValid: boolean;
     errors: string[]; // List of validation error messages
 }
+
+
+// --- Zod Schemas for Validation ---
+
+const LogLevelSchema = z.enum(['error', 'warn', 'info', 'debug']);
+
+// Define GatewaySettings schema first as it's used in ConfigSchema
+export const GatewaySettingsSchema = z.object({
+    ssePort: z.number().int().positive().optional().nullable(), // Allow null/undefined
+    sseHost: z.string().min(1).default('localhost'),
+    ssePath: z.string().min(1).default('/events'),
+    wsPort: z.number().int().positive().optional().nullable(), // Allow null/undefined
+    logLevel: LogLevelSchema.default('info'),
+}).strict(); // Disallow extra properties in settings
+
+export const ServerConfigSchema = z.object({
+    command: z.string().min(1),
+    args: z.array(z.string()).default([]),
+    env: z.record(z.string()).default({}),
+    workingDir: z.string().optional(), // Default applied during processing
+    autoRestart: z.boolean().default(false),
+    maxRestarts: z.number().int().min(0).default(3),
+}).strict(); // Disallow extra properties in server config
+
+// Define the main Config schema using the above schemas
+export const ConfigSchema = z.object({
+    mcpServers: z.record(ServerConfigSchema),
+    settings: GatewaySettingsSchema.optional(), // Settings block is optional
+}).strict(); // Disallow extra top-level properties
+
+// --- Derive and export types from Zod schemas ---
+export type Config = z.infer<typeof ConfigSchema>;
+export type ServerConfig = z.infer<typeof ServerConfigSchema>;
+export type GatewaySettings = z.infer<typeof GatewaySettingsSchema>;

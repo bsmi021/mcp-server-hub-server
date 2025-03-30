@@ -28,6 +28,14 @@ export class Logger {
     }
 
     /**
+     * Gets the current log level.
+     * @returns The current log level.
+     */
+    public getLevel(): LogLevel {
+        return this.currentLevel;
+    }
+
+    /**
      * Logs a debug message (lowest level).
      * @param message - The message to log.
      * @param args - Additional arguments to log.

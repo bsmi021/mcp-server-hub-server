@@ -1,6 +1,6 @@
 ﻿/**
- * Base custom error class for application-specific errors.
- */
+* Base custom error class for application-specific errors.
+*/
 export class BaseError extends Error {
     public readonly code: string;
     public readonly status: number; // HTTP status code equivalent

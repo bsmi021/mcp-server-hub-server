@@ -129,7 +129,11 @@ dist
 .yarn/install-state.gz
 .pnp.*
 
+memory-bank/
+
 docs/
 .llm-context/
 .llm-context/*
 
+Grid System Feature Specification.md
+Political Citybuilder Game - PRD.md

@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node dist/server.js",
     "start:client": "node dist/client/client.js",
-    "build": "tsc && dir dist",
+    "build": "tsc",
     "dev": "nodemon --watch src --ext ts --exec \"node --loader ts-node/esm src/server.ts\"",
     "lint": "eslint . --ext .ts",
     "format": "prettier --write \"src/**/*.ts\"",
@@ -26,11 +26,14 @@
     "@types/inquirer": "^9.0.7",
     "@types/ws": "^8.18.0",
     "chalk": "^5.3.0",
+    "chokidar": "^4.0.3",
     "inquirer": "^12.5.0",
-    "ws": "^8.18.1"
+    "ws": "^8.18.1",
+    "@modelcontextprotocol/sdk": "^1.8.0",
+    "chokidar": "^3.6.0",
+    "zod": "^3.24.2"
   },
   "devDependencies": {
-    "@modelcontextprotocol/sdk": "^1.8.0",
     "@types/jest": "^29.5.14",
     "@types/node": "^20.17.28",
     "@typescript-eslint/eslint-plugin": "^7.13.0",
