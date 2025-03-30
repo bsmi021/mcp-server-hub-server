@@ -80,9 +80,10 @@ export class ConfigurationManager extends EventEmitter {
             this.setupWatcher(); // Setup watcher only after successful initial load
 
         } catch (error: any) {
-            logger.error(`FATAL: Failed to load initial configuration from ${this.configPath ?? configPath}: ${error.message}`);
-            // In a real app, might want to exit or enter a degraded state
-            throw new McpError(ErrorCode.InvalidParams, `Failed to load initial config: ${error.message}`, error);
+            const errorMessage = `FATAL: Failed to load initial configuration from ${this.configPath ?? configPath}: ${error.message}`;
+            logger.error(errorMessage, error); // Log the original error too
+            // Use InternalError for initial load failures as InitializationError isn't standard
+            throw new McpError(ErrorCode.InternalError, `Failed to load initial config: ${error.message}`, error);
         } finally {
             this.isLoading = false;
         }
@@ -139,9 +140,10 @@ export class ConfigurationManager extends EventEmitter {
             }
 
         } catch (error: any) {
-            logger.error(`Failed to load, parse, or validate configuration from ${filePath}: ${error.message}`);
+            const loadError = new Error(`Failed to load, parse, or validate configuration from ${filePath}: ${error.message}`);
+            logger.error(loadError.message, error); // Log original error as details
             // Don't update this.config on error, keep the old valid one active
-            throw error; // Re-throw to be handled by caller (initial load or watcher handler)
+            throw loadError; // Re-throw as a generic error for reload failures
         }
     }
 
