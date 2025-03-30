@@ -16,8 +16,10 @@ import {
 import { logger } from '../utils/logger.js'; // Assuming shared logger for now
 
 // --- Configuration ---
-// TODO: Make this configurable if needed
-const GATEWAY_SERVER_URL = 'ws://localhost:8081'; // Default URL for the Gateway Server
+const GATEWAY_SERVER_URL = process.env.GATEWAY_WS_URL || 'ws://localhost:8081'; // Allow overriding WS URL
+const DEFAULT_POLLING_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const rawInterval = process.env.CLIENT_TOOL_REFRESH_INTERVAL_MS;
+const POLLING_INTERVAL_MS = rawInterval && /^\d+$/.test(rawInterval) ? parseInt(rawInterval, 10) : DEFAULT_POLLING_INTERVAL_MS;
 
 // --- Types for WebSocket Communication ---
 // Reusing types defined in WebSocketInterface might be better if possible,
@@ -43,6 +45,7 @@ interface EventPayload {
  * - Connects to the main Gateway Server via WebSocket.
  * - Listens for LLM Client connections via STDIO.
  * - Proxies MCP requests between LLM Clients and the Gateway Server.
+ * - Polls the Gateway Server for tool list updates.
  */
 class GatewayClient {
     private ws: WebSocket | null = null;
@@ -50,8 +53,9 @@ class GatewayClient {
     private isWsConnected = false;
     private reconnectInterval = 5000; // 5 seconds
     private pendingRequests: Map<string, { resolve: (value: any) => void, reject: (reason?: any) => void }> = new Map();
-    // Queue for requests made before WS is connected - Use specific types for resolve/reject
     private requestQueue: Array<{ id: string, method: string, params: any, resolve: (value: any) => void, reject: (reason?: any) => void }> = [];
+    private pollingIntervalId: NodeJS.Timeout | null = null;
+    private knownTools: ListToolsResult | null = null; // Store the last known tool list
 
     constructor() {
         // Initialize the MCP Server part that listens to LLM clients via STDIO
@@ -84,9 +88,10 @@ class GatewayClient {
         this.ws.on('open', () => {
             logger.info('Connected to Gateway Server via WebSocket.');
             this.isWsConnected = true;
-            // Process any queued requests now that we are connected
+            // Process any queued requests
             this.processRequestQueue();
-            // TODO: Maybe request initial state (like tool list) from gateway?
+            // Perform initial tool list fetch and start polling
+            this.initializeToolPolling();
         });
 
         this.ws.on('message', (data) => {
@@ -97,6 +102,8 @@ class GatewayClient {
             logger.warn(`WebSocket connection closed. Code: ${code}, Reason: ${reason?.toString()}. Attempting reconnect in ${this.reconnectInterval / 1000}s...`);
             this.isWsConnected = false;
             this.ws = null;
+            // Stop polling on close
+            this.stopToolPolling();
             // Reject any pending requests
             this.rejectPendingRequests('WebSocket connection closed');
             setTimeout(() => this.connectWebSocket(), this.reconnectInterval);
@@ -105,6 +112,8 @@ class GatewayClient {
         this.ws.on('error', (error) => {
             logger.error(`WebSocket connection error: ${error.message}`);
             this.isWsConnected = false;
+            // Stop polling on error
+            this.stopToolPolling();
             this.ws = null; // Ensure ws is null on error before attempting reconnect
             // Connection will likely close, triggering the 'close' handler for reconnect logic
         });
@@ -303,11 +312,113 @@ class GatewayClient {
         }
     }
 
+    // --- Tool Polling Logic ---
+
+    /**
+     * Fetches the initial tool list and starts the polling interval.
+     */
+    private async initializeToolPolling(): Promise<void> {
+        logger.info('Performing initial tool list fetch...');
+        try {
+            const initialTools = await this.sendWebSocketRequest('mcp_listTools', {}) as ListToolsResult;
+            this.updateKnownTools(initialTools);
+            logger.info(`Initial tool list fetched (${this.knownTools?.tools?.length ?? 0} tools). Starting polling interval (${POLLING_INTERVAL_MS}ms).`);
+            // Clear any existing interval just in case
+            this.stopToolPolling();
+            // Start the polling timer
+            this.pollingIntervalId = setInterval(() => this.pollForTools(), POLLING_INTERVAL_MS);
+        } catch (error: any) {
+            logger.error('Failed to fetch initial tool list:', error);
+            // Optionally retry initial fetch or rely on the first poll interval
+            // For now, start polling anyway, it will retry
+            if (!this.pollingIntervalId) {
+                logger.info(`Starting polling interval (${POLLING_INTERVAL_MS}ms) despite initial fetch failure.`);
+                this.pollingIntervalId = setInterval(() => this.pollForTools(), POLLING_INTERVAL_MS);
+            }
+        }
+    }
+
+    /**
+     * Stops the tool polling interval timer.
+     */
+    private stopToolPolling(): void {
+        if (this.pollingIntervalId) {
+            logger.info('Stopping tool list polling.');
+            clearInterval(this.pollingIntervalId);
+            this.pollingIntervalId = null;
+        }
+    }
+
+    /**
+     * Fetches the current tool list from the gateway and updates the known list.
+     */
+    private async pollForTools(): Promise<void> {
+        logger.debug('Polling for tool list updates...');
+        try {
+            const currentTools = await this.sendWebSocketRequest('mcp_listTools', {}) as ListToolsResult;
+            this.updateKnownTools(currentTools);
+        } catch (error: any) {
+            logger.warn('Failed to poll for tool list:', error);
+            // Don't stop polling on error, just log and wait for the next interval
+        }
+    }
+
+    /**
+     * Compares the newly fetched tool list with the known list and logs changes.
+     * @param newTools - The newly fetched ListToolsResult.
+     */
+    private updateKnownTools(newTools: ListToolsResult): void {
+        if (!newTools || !Array.isArray(newTools.tools)) {
+            logger.warn('Received invalid tool list format during update.');
+            return;
+        }
+
+        const oldToolMap = new Map(this.knownTools?.tools?.map(t => [t.name, t]));
+        const newToolMap = new Map(newTools.tools.map(t => [t.name, t]));
+        let changed = false;
+
+        // Check for added/updated tools
+        newToolMap.forEach((newTool, name) => {
+            if (!oldToolMap.has(name)) {
+                logger.info(`[Tool Update] Tool added: ${name}`);
+                changed = true;
+            } else {
+                // Basic check for description/schema changes (more robust diffing needed for real updates)
+                const oldTool = oldToolMap.get(name);
+                if (JSON.stringify(oldTool) !== JSON.stringify(newTool)) {
+                    logger.info(`[Tool Update] Tool updated: ${name}`); // Simple update log
+                    changed = true;
+                }
+            }
+        });
+
+        // Check for removed tools
+        oldToolMap.forEach((oldTool, name) => {
+            if (!newToolMap.has(name)) {
+                logger.info(`[Tool Update] Tool removed: ${name}`);
+                changed = true;
+            }
+        });
+
+        this.knownTools = newTools; // Update the known list
+
+        if (changed) {
+            logger.debug(`Tool list updated. Current count: ${this.knownTools?.tools?.length ?? 0}`);
+            // TODO: Emit an event or notify relevant client parts about the change?
+        } else {
+            logger.debug('Tool list polled, no changes detected.');
+        }
+    }
+
+    // --- Shutdown Logic Update ---
+
     /**
      * Stops the client gracefully.
      */
     public async stop(): Promise<void> {
         logger.info('Stopping Gateway Client...');
+        // Stop polling
+        this.stopToolPolling();
         // Close WebSocket connection
         if (this.ws) {
             // Remove listeners to prevent reconnect attempts during shutdown

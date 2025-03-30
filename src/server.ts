@@ -6,6 +6,7 @@ import { ToolRegistry } from './managers/ToolRegistry.js';
 import { StdioInterface } from './interfaces/StdioInterface.js';
 // import { SseInterface } from './interfaces/SseInterface.js'; // Comment out or remove SSE
 import { WebSocketInterface } from './interfaces/WebSocketInterface.js'; // Import WebSocketInterface
+import { ExampleConfigurableService } from './services/ExampleConfigurableService.js'; // Import Example Service
 import { logger } from './utils/logger.js';
 
 // --- Configuration Loading ---
@@ -27,22 +28,22 @@ async function main() {
     let toolRegistry: ToolRegistry | null = null;
     let stdioInterface: StdioInterface | null = null;
     // let sseInterface: SseInterface | null = null; // Comment out or remove SSE
-    let webSocketInterface: WebSocketInterface | null = null; // Add WebSocketInterface
+    let webSocketInterface: WebSocketInterface | null = null;
+    let exampleService: ExampleConfigurableService | null = null; // Add example service instance
 
     try {
-        // 2. Load Configuration
+        // 2. Initialize Managers (they need to exist to subscribe to config events)
+        serverManager = new ServerManager(configManager);
+        toolRegistry = new ToolRegistry(serverManager, configManager);
+        // DO NOT instantiate services/interfaces yet
+
+        // 3. Load Configuration (This will emit events that managers listen for)
         await configManager.loadConfig(configPath);
         // Logger level is set automatically by configManager after loading
 
-        // 3. Initialize Managers
-        serverManager = new ServerManager(configManager);
-        // Pass configManager to ToolRegistry constructor
-        toolRegistry = new ToolRegistry(serverManager, configManager);
-
-        // Initialize server instances (creates map, doesn't spawn yet)
-        serverManager.initializeServers();
-
-        // 4. Initialize Interfaces
+        // 4. Initialize Services and Interfaces AFTER config is loaded
+        // Now they will get the correct initial config in their constructors
+        exampleService = new ExampleConfigurableService(configManager); // Instantiate example service
         stdioInterface = new StdioInterface(toolRegistry, serverManager, configManager); // Pass configManager
         // sseInterface = new SseInterface(toolRegistry, serverManager, configManager); // Comment out or remove SSE
         webSocketInterface = new WebSocketInterface(toolRegistry, serverManager, configManager); // Initialize WebSocketInterface
@@ -62,25 +63,25 @@ async function main() {
     } catch (error: any) {
         logger.error(`Fatal error during startup: ${error.message}`, error);
         // Attempt graceful shutdown of any components that might have started
-        await shutdown(stdioInterface, webSocketInterface, serverManager, 1); // Pass webSocketInterface to shutdown
+        await shutdown(stdioInterface, webSocketInterface, serverManager, exampleService, 1); // Pass exampleService
         return; // Ensure we don't proceed after fatal error
     }
 
     // --- Graceful Shutdown Handling ---
     const handleShutdown = async (signal: string) => {
         logger.info(`Received ${signal}. Shutting down gracefully...`);
-        await shutdown(stdioInterface, webSocketInterface, serverManager, 0); // Pass webSocketInterface to shutdown
+        await shutdown(stdioInterface, webSocketInterface, serverManager, exampleService, 0); // Pass exampleService
     };
 
     process.on('SIGINT', () => handleShutdown('SIGINT')); // Ctrl+C
     process.on('SIGTERM', () => handleShutdown('SIGTERM')); // Termination signal
     process.on('uncaughtException', async (error) => {
         logger.error('Unhandled Exception:', error);
-        await shutdown(stdioInterface, webSocketInterface, serverManager, 1); // Pass webSocketInterface to shutdown
+        await shutdown(stdioInterface, webSocketInterface, serverManager, exampleService, 1); // Pass exampleService
     });
     process.on('unhandledRejection', async (reason, promise) => {
         logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
-        await shutdown(stdioInterface, webSocketInterface, serverManager, 1); // Pass webSocketInterface to shutdown
+        await shutdown(stdioInterface, webSocketInterface, serverManager, exampleService, 1); // Pass exampleService
     });
 
 }
@@ -90,18 +91,23 @@ async function main() {
  */
 async function shutdown(
     stdio: StdioInterface | null,
-    ws: WebSocketInterface | null, // Change sse to ws
+    ws: WebSocketInterface | null,
     manager: ServerManager | null,
+    exampleSvc: ExampleConfigurableService | null, // Add example service
     exitCode: number
 ): Promise<void> {
     logger.info('Initiating shutdown sequence...');
     try {
-        // Stop interfaces first to prevent new client connections/requests
+        // Stop interfaces first
         await Promise.allSettled([
             stdio?.stop(),
-            ws?.stop() // Stop ws instead of sse
+            ws?.stop()
         ]);
         logger.info('Interfaces stopped.');
+
+        // Stop services
+        exampleSvc?.destroy(); // Call destroy on example service
+        logger.info('Services stopped.');
 
         // Stop managed servers
         if (manager) {
@@ -122,5 +128,5 @@ main().catch(async (error) => {
     // Catch errors specifically from the main async function itself
     logger.error(`Unhandled error in main function: ${error.message}`, error);
     // Attempt shutdown even if main fails early
-    await shutdown(null, null, null, 1); // Pass nulls for interfaces as they might not be initialized
+    await shutdown(null, null, null, null, 1); // Pass nulls for interfaces/services
 });

@@ -29,23 +29,14 @@ export abstract class ServiceAdapter extends EventEmitter {
         logger.debug(`Service adapter "${this.constructor.name}" received config update.`);
         const oldConfig = this.currentConfig;
         this.currentConfig = newConfig;
-        // Call the implementation-specific update logic
-        try {
-            this.updateServiceConfig(newConfig, oldConfig);
-        } catch (error: any) {
-            logger.error(`Error updating service "${this.constructor.name}" config: ${error.message}`);
-            // Optionally revert currentConfig or handle error state?
-        }
+        // No longer call an abstract method here. Subclasses handle specific events.
+        // The 'configChanged' event listener on the base class might not even be needed
+        // if all updates are handled via specific events from ConfigurationManager.
+        // For now, just update the internal currentConfig state.
     }
 
-    /**
-     * Abstract method to be implemented by subclasses.
-     * This method is called when the configuration has changed, allowing the
-     * service to adapt its behavior or internal state.
-     * @param newConfig - The complete new configuration object.
-     * @param oldConfig - The previous configuration object (can be null on initial load).
-     */
-    protected abstract updateServiceConfig(newConfig: Config, oldConfig: Config | null): void;
+    // Remove the abstract method - subclasses should listen to specific events now
+    // protected abstract updateServiceConfig(newConfig: Config, oldConfig: Config | null): void;
 
     /**
      * Cleans up resources, like removing the configuration listener.

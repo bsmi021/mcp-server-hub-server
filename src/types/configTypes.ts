@@ -34,8 +34,17 @@ export const ConfigSchema = z.object({
     mcpServers: z.record(ServerConfigSchema),
     settings: GatewaySettingsSchema.optional(), // Settings block is optional
     // Add the new section for hub-specific tools
-    hubTools: z.record(z.lazy(() => HubToolConfigSchema)).optional(), // Optional section, maps tool name to config. Use z.lazy if HubToolConfigSchema references itself indirectly, otherwise remove. Assuming simple structure for now.
+    hubTools: z.record(z.lazy(() => HubToolConfigSchema)).optional(),
+    // Add section for the example service settings
+    exampleService: z.lazy(() => ExampleServiceSettingsSchema).optional(),
 }).strict(); // Disallow extra top-level properties
+
+
+// --- Schema for Example Service Settings ---
+export const ExampleServiceSettingsSchema = z.object({
+    featureFlag: z.boolean().default(false).describe("An example boolean flag for the service."),
+    messagePrefix: z.string().default("DEFAULT").describe("An example string setting."),
+}).strict();
 
 
 // --- Schema for individual Hub Tool Configuration ---
@@ -59,5 +68,7 @@ export const HubToolConfigSchema = z.object({
 export type Config = z.infer<typeof ConfigSchema>;
 // Add HubToolConfig type
 export type HubToolConfig = z.infer<typeof HubToolConfigSchema>;
+// Add ExampleServiceSettings type
+export type ExampleServiceSettings = z.infer<typeof ExampleServiceSettingsSchema>;
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
 export type GatewaySettings = z.infer<typeof GatewaySettingsSchema>;

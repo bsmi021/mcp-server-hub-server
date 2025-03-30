@@ -3,9 +3,10 @@ import * as path from 'path';
 import { EventEmitter } from 'events';
 import chokidar, { FSWatcher } from 'chokidar';
 import { z } from 'zod';
-import { Config, ServerConfig, GatewaySettings, ConfigSchema } from '../types/configTypes.js';
+import { Config, ServerConfig, GatewaySettings, ConfigSchema, HubToolConfig } from '../types/configTypes.js'; // Import HubToolConfig
 import { logger } from '../utils/logger.js';
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js'; // Correct import with .js extension
+import { ConfigEvents, ServerAddedPayload, ServerRemovedPayload, ServerUpdatedPayload, HubToolAddedPayload, HubToolRemovedPayload, HubToolUpdatedPayload, SettingsUpdatedPayload, ExampleServiceUpdatedPayload, ConfigProcessedPayload } from '../types/eventTypes.js'; // Import new event types (Added ExampleServiceUpdatedPayload)
 
 // Default values for gateway settings - Ensure this aligns with ConfigSchema defaults if any
 const DEFAULT_GATEWAY_SETTINGS: Required<Omit<GatewaySettings, 'wsPort'>> & Pick<GatewaySettings, 'wsPort'> = {
@@ -127,15 +128,27 @@ export class ConfigurationManager extends EventEmitter {
                 // No need to log here, setLevel already logs
             }
 
-            // Emit event only if config actually changed
-            if (oldConfig !== newConfigString) {
-                logger.info('Configuration change detected, emitting event.');
-                // Provide the processed new config and potentially the old raw string or parsed object
-                // For simplicity, just emitting the new config for now. Listeners can fetch old via getter if needed before update.
-                this.emit('configChanged', { /* oldConfig: oldConfig ? JSON.parse(oldConfig) : null, */ newConfig: this.config });
-            } else if (oldConfig === null) { // Check if it was the initial load
-                logger.info('Initial configuration processed.');
+            // --- Diffing and Emitting Granular Events ---
+            const oldParsedConfig = oldConfig ? JSON.parse(oldConfig) as Config : null;
+            let changesDetected = false;
+
+            if (oldParsedConfig) { // Only diff if there was a previous config
+                changesDetected = this.diffAndEmitChanges(oldParsedConfig, this.config);
             } else {
+                // Initial load: emit 'added' events for everything present
+                logger.info('Initial configuration processed. Emitting initial state events.');
+                this.emitInitialStateEvents(this.config);
+                changesDetected = true; // Mark as changed for the final event
+            }
+
+            // Emit a final event indicating processing is complete, regardless of specific changes found (unless identical)
+            if (oldConfig !== newConfigString) {
+                this.emit(ConfigEvents.CONFIG_CHANGED_PROCESSED, { oldConfig: oldParsedConfig, newConfig: this.config } as ConfigProcessedPayload);
+            } else if (oldConfig === null) {
+                // Also emit for initial load completion
+                this.emit(ConfigEvents.CONFIG_CHANGED_PROCESSED, { oldConfig: null, newConfig: this.config } as ConfigProcessedPayload);
+            }
+            else {
                 logger.info('Configuration file reloaded, but no effective changes detected after processing.');
             }
 
@@ -146,6 +159,154 @@ export class ConfigurationManager extends EventEmitter {
             throw loadError; // Re-throw as a generic error for reload failures
         }
     }
+
+    /**
+     * Compares the old and new configuration to identify changes and emit specific events.
+     * @param oldConfig - The previous configuration object.
+     * @param newConfig - The new configuration object.
+     * @returns True if any changes were detected and events emitted, false otherwise.
+     */
+    private diffAndEmitChanges(oldConfig: Config, newConfig: Config): boolean {
+        let changed = false;
+        const oldServers = oldConfig.mcpServers || {};
+        const newServers = newConfig.mcpServers || {};
+        const oldHubTools = oldConfig.hubTools || {};
+        const newHubTools = newConfig.hubTools || {};
+        const oldSettings = oldConfig.settings || {};
+        const newSettings = newConfig.settings || {};
+
+        const oldServerIds = new Set(Object.keys(oldServers));
+        const newServerIds = new Set(Object.keys(newServers));
+        const oldHubToolNames = new Set(Object.keys(oldHubTools));
+        const newHubToolNames = new Set(Object.keys(newHubTools));
+
+        // Check for added/updated servers
+        for (const serverId of newServerIds) {
+            const newConf = newServers[serverId] as Required<ServerConfig>; // Assume processed
+            if (!oldServerIds.has(serverId)) {
+                logger.info(`Detected added server: ${serverId}`);
+                this.emit(ConfigEvents.SERVER_ADDED, { serverId, config: newConf } as ServerAddedPayload);
+                changed = true;
+            } else {
+                const oldConf = oldServers[serverId] as Required<ServerConfig>;
+                if (JSON.stringify(oldConf) !== JSON.stringify(newConf)) {
+                    logger.info(`Detected updated server: ${serverId}`);
+                    this.emit(ConfigEvents.SERVER_UPDATED, { serverId, newConfig: newConf, oldConfig: oldConf } as ServerUpdatedPayload);
+                    changed = true;
+                }
+            }
+        }
+        // Check for removed servers
+        for (const serverId of oldServerIds) {
+            if (!newServerIds.has(serverId)) {
+                logger.info(`Detected removed server: ${serverId}`);
+                this.emit(ConfigEvents.SERVER_REMOVED, { serverId } as ServerRemovedPayload);
+                changed = true;
+            }
+        }
+
+        // Check for added/updated hub tools
+        for (const toolName of newHubToolNames) {
+            const newConf = newHubTools[toolName];
+            const gatewayToolName = `hub__${toolName}`; // Consistent naming
+            if (!oldHubToolNames.has(toolName)) {
+                logger.info(`Detected added hub tool: ${toolName}`);
+                this.emit(ConfigEvents.HUB_TOOL_ADDED, { toolName, gatewayToolName, config: newConf } as HubToolAddedPayload);
+                changed = true;
+            } else {
+                const oldConf = oldHubTools[toolName];
+                if (JSON.stringify(oldConf) !== JSON.stringify(newConf)) {
+                    logger.info(`Detected updated hub tool: ${toolName}`);
+                    this.emit(ConfigEvents.HUB_TOOL_UPDATED, { toolName, gatewayToolName, newConfig: newConf, oldConfig: oldConf } as HubToolUpdatedPayload);
+                    changed = true;
+                }
+            }
+        }
+        // Check for removed hub tools
+        for (const toolName of oldHubToolNames) {
+            if (!newHubToolNames.has(toolName)) {
+                const gatewayToolName = `hub__${toolName}`;
+                logger.info(`Detected removed hub tool: ${toolName}`);
+                this.emit(ConfigEvents.HUB_TOOL_REMOVED, { toolName, gatewayToolName } as HubToolRemovedPayload);
+                changed = true;
+            }
+        }
+
+        // Check for updated settings
+        // Ensure comparison handles defaults correctly by comparing processed/defaulted objects
+        const processedOldSettings = { ...DEFAULT_GATEWAY_SETTINGS, ...oldSettings };
+        const processedNewSettings = { ...DEFAULT_GATEWAY_SETTINGS, ...newSettings };
+        if (JSON.stringify(processedOldSettings) !== JSON.stringify(processedNewSettings)) {
+            logger.info(`Detected updated settings.`);
+            this.emit(ConfigEvents.SETTINGS_UPDATED, { newSettings: processedNewSettings, oldSettings: processedOldSettings } as SettingsUpdatedPayload);
+            changed = true;
+        }
+
+        // Check for updated exampleService settings
+        // Import DEFAULT_EXAMPLE_SETTINGS if needed, or define it here/in configTypes
+        // Assuming DEFAULT_EXAMPLE_SETTINGS is accessible or defined in configTypes
+        const oldExampleSettings = oldConfig.exampleService; // Already processed/defaulted if it existed
+        const newExampleSettings = newConfig.exampleService; // Already processed/defaulted
+        // Need to handle cases where the section might not exist in old/new config after processing
+        // Let's assume processConfig ensures the section exists with defaults if defined in schema
+        if (JSON.stringify(oldExampleSettings) !== JSON.stringify(newExampleSettings)) {
+            // Need to ensure we have the Required<> type after defaults applied by Zod/processConfig
+            // This might require adjusting processConfig or using defaults here.
+            // For now, assume they are correctly defaulted if present.
+            // We need the DEFAULT_EXAMPLE_SETTINGS from ExampleConfigurableService or configTypes.
+            // Let's import it or define it. For simplicity, assume it's imported/available.
+            // const DEFAULT_EXAMPLE_SETTINGS = ... // Assume imported or defined
+            const processedOldExample = { /* ...DEFAULT_EXAMPLE_SETTINGS, */ ...(oldExampleSettings || {}) };
+            const processedNewExample = { /* ...DEFAULT_EXAMPLE_SETTINGS, */ ...(newExampleSettings || {}) };
+
+            // Re-check after applying defaults explicitly if needed
+            if (JSON.stringify(processedOldExample) !== JSON.stringify(processedNewExample)) {
+                logger.info(`Detected updated exampleService settings.`);
+                // TODO: Ensure the payload types match Required<ExampleServiceSettings>
+                this.emit(ConfigEvents.EXAMPLE_SERVICE_UPDATED, {
+                    newSettings: processedNewExample, // Cast might be needed
+                    oldSettings: processedOldExample  // Cast might be needed
+                } as ExampleServiceUpdatedPayload);
+                changed = true;
+            }
+        }
+
+
+        if (!changed) {
+            logger.info('Configuration file reloaded, but no effective changes detected after diffing.');
+        }
+        return changed;
+    }
+
+    /**
+     * Emits initial 'added' events for all items present in the first loaded configuration.
+     * @param initialConfig - The initially loaded and processed configuration.
+     */
+    private emitInitialStateEvents(initialConfig: Config): void {
+        // Emit server added events
+        for (const serverId in initialConfig.mcpServers) {
+            this.emit(ConfigEvents.SERVER_ADDED, {
+                serverId,
+                config: initialConfig.mcpServers[serverId] as Required<ServerConfig>
+            } as ServerAddedPayload);
+        }
+        // Emit hub tool added events
+        for (const toolName in initialConfig.hubTools) {
+            const gatewayToolName = `hub__${toolName}`;
+            this.emit(ConfigEvents.HUB_TOOL_ADDED, {
+                toolName,
+                gatewayToolName,
+                config: initialConfig.hubTools[toolName]
+            } as HubToolAddedPayload);
+        }
+        // Emit initial settings (treat as update from defaults)
+        const processedSettings = { ...DEFAULT_GATEWAY_SETTINGS, ...(initialConfig.settings || {}) };
+        this.emit(ConfigEvents.SETTINGS_UPDATED, {
+            newSettings: processedSettings,
+            oldSettings: DEFAULT_GATEWAY_SETTINGS // Compare against initial defaults
+        } as SettingsUpdatedPayload);
+    }
+
 
     /**
     * Sets up the file watcher using chokidar.

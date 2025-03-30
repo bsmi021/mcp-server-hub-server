@@ -1,8 +1,47 @@
 {
-    "mcpServers": {},
+    "mcpServers": {
+        "MCPServer1": {
+            "command": "node",
+            "args": [
+                "D:/Projects/mcp-servers/MCPServer1/build/index.js"
+            ]
+        },
+        "MCPServer2": {
+            "command": "node",
+            "args": [
+                "d:/Projects/mcp-servers/MCPServer2/build/index.js"
+            ],
+            "env": {
+                "TEMPLATES_PATH": "d:/Projects/mcp-servers/MCPServer2/templates"
+            }
+        },
+        "MCPServer3": {
+            "command": "node",
+            "args": [
+                "D:/Projects/mcp-servers/MCPServer3/build/index.js"
+            ],
+            "env": {
+                "WEB_UI_PORT": "3099",
+                "WS_PORT": "8088",
+                "DB_ROOT": "C:/Users/user/Documents"
+            }
+        }
+    },
     "settings": {
         "logLevel": "info",
         "wsPort": 8081,
         "ssePort": null
+    },
+    "hubTools": {
+        "example": {
+            "description": "An example tool provided by the hub itself.",
+            "modulePath": "./exampleHubTool.js",
+            "handlerExport": "default",
+            "enabled": true
+        }
+    },
+    "exampleService": {
+        "featureFlag": false,
+        "messagePrefix": "INITIAL"
     }
 }

@@ -1,6 +1,6 @@
 ﻿# MCP Server Hub / Gateway
 
-**Purpose:** This project provides a central gateway to manage multiple MCP (Model Context Protocol) servers, preventing the need to configure and run duplicate server processes for each LLM client (like Cline, Cursor, etc.). Connect your LLM client to the single `gateway-client` endpoint provided by this project to access tools from all your managed MCP servers through one interface.
+**Purpose:** This project provides a central gateway to manage multiple MCP (Model Context Protocol) servers and expose hub-native tools, preventing the need to configure and run duplicate server processes for each LLM client (like Cline, Cursor, etc.). It supports **dynamic configuration reloading**, allowing managed servers and hub tools/services to be updated without restarting the main gateway server. Connect your LLM client to the single `gateway-client` endpoint provided by this project to access tools from all your managed MCP servers and the hub itself through one interface.
 
 ## Architecture
 
@@ -8,18 +8,22 @@ The system consists of two main components within this repository:
 
 1. **Gateway Server (`src/server.ts`):**
     * The core hub process that runs persistently.
-    * Reads a central configuration file (`dist/mcp_hub_config.json`) listing the actual MCP servers to manage.
-    * Spawns, monitors, and manages the lifecycle of these underlying MCP server processes.
-    * Listens for WebSocket connections from Gateway Clients.
-    * Discovers tools from managed servers and exposes them with a namespaced format (`serverId__toolName`) to prevent naming conflicts.
-    * Routes tool calls received from Gateway Clients to the appropriate managed server.
+    * Reads an initial configuration file (`mcp_hub_config.json`) during startup. **Crucially, the build process copies this file to the `dist/` directory, and the running server watches the `dist/mcp_hub_config.json` file for changes.**
+    * **Dynamically manages** the lifecycle (start, stop, monitor, restart) of underlying MCP servers defined in the `mcpServers` config section.
+    * **Dynamically loads/unloads/updates** hub-native tools defined in the `hubTools` config section.
+    * Supports **configurable internal services** (like `exampleService`) that react to config changes.
+    * Listens for WebSocket connections from Gateway Clients (default port 8081).
+    * Discovers tools from managed servers and exposes them with a `serverId__toolName` namespace.
+    * Exposes hub-native tools with a `hub__toolName` namespace.
+    * Routes tool calls received from Gateway Clients to the appropriate managed server or internal hub tool handler.
 
 2. **Gateway Client (`src/client/client.ts`):**
-    * Acts as the proxy server that LLM clients connect to.
+    * Acts as the proxy server that LLM clients connect to via STDIO.
     * Connects to the running Gateway Server via WebSocket (with auto-reconnect).
-    * Listens on STDIO for connections from LLM Clients.
     * Forwards MCP requests (like `mcp_listTools`, `mcp_callTool`) from the LLM Client to the Gateway Server.
     * Returns responses from the Gateway Server back to the LLM Client.
+    * **Periodically polls** the Gateway Server for tool list updates to handle dynamic changes (configurable via `CLIENT_TOOL_REFRESH_INTERVAL_MS` env var, defaults to 5 minutes). (Does not work in Claude Desktop)
+    * Restart the MCP client process to refresh the tool list.
 
 **Workflow Diagram:**
 
@@ -28,29 +32,33 @@ flowchart LR
     subgraph "User Machine"
         LLM_Client1["LLM Client (e.g., Cline)"]
         LLM_Client2["LLM Client (e.g., Cursor)"]
-        
+
         subgraph "Gateway Client Process"
-            GatewayClient["Gateway Client App"]
+            style GatewayClientProcess fill:#f9f,stroke:#333,stroke-width:2px
+            GatewayClient["Gateway Client App\n(client.ts)"]
         end
-        
+
         subgraph "Gateway Server Process"
-            GatewayServer["Gateway Server (mcp-server-hub-server)"]
-            MCPServer1["MCP Server (e.g., Thought)"]
-            MCPServer2["MCP Server (e.g., File Ops)"]
-            ConfigFile["mcp_hub_config.json in AppData"]
+            style GatewayServerProcess fill:#ccf,stroke:#333,stroke-width:2px
+            GatewayServer["Gateway Server\n(server.ts)"]
+            ConfigFile["dist/mcp_hub_config.json"] --- Watcher["File Watcher"]
+            Watcher -- "Triggers Reload" --> GatewayServer
+            MCPServer1["Managed MCP Server 1"]
+            MCPServer2["Managed MCP Server 2"]
+            HubTool["Hub Tool\n(e.g., exampleHubTool.ts)"]
+            HubService["Hub Service\n(e.g., ExampleConfigurableService.ts)"]
         end
     end
-    
-    LLM_Client1 -- "STDIO/SSE" --> GatewayClient
-    LLM_Client2 -- "STDIO/SSE" --> GatewayClient
+
+    LLM_Client1 -- "STDIO" --> GatewayClient
+    LLM_Client2 -- "STDIO" --> GatewayClient
     GatewayClient -- "WebSocket" --> GatewayServer
-    GatewayServer -- "Manages" --> MCPServer1
-    GatewayServer -- "Manages" --> MCPServer2
-    GatewayServer -- "Reads" --> ConfigFile
-    GatewayClient -- "Checks/Starts" --> GatewayServer
-    
-    style GatewayClient fill:#f9f,stroke:#333,stroke-width:2px
-    style GatewayServer fill:#ccf,stroke:#333,stroke-width:2px
+    GatewayServer -- "Manages/Proxies" --> MCPServer1
+    GatewayServer -- "Manages/Proxies" --> MCPServer2
+    GatewayServer -- "Loads/Runs" --> HubTool
+    GatewayServer -- "Uses" --> HubService
+    GatewayServer -- "Reads/Watches" --> ConfigFile
+
 ```
 
 ## Getting Started
@@ -72,69 +80,89 @@ flowchart LR
 npm install
 
 # Build the Gateway Server and Client code
+# This compiles TypeScript AND copies mcp_hub_config.json to dist/
 npm run build
 ```
 
-This compiles the TypeScript code into the `dist/` directory.
+### 3. Configuration (`mcp_hub_config.json`)
 
-### 3. Configuration (`dist/mcp_hub_config.json`)
+Configure the hub by editing the `mcp_hub_config.json` file in the **project root directory**. The `npm run build` command will copy this file into the `dist/` directory. The running server watches the file inside `dist/` for live changes.
 
-The Gateway Server requires a configuration file named `mcp_hub_config.json`.
-
-**IMPORTANT:** You must place this file inside the `dist/` directory *after* running `npm run build`, as the build process might clean the `dist` folder.
-
-This file tells the Gateway Server which underlying MCP servers to start and manage.
-
-**Example `dist/mcp_hub_config.json`:**
+**Example `mcp_hub_config.json`:**
 
 ```json
 {
   "mcpServers": {
     "thought-server": {
       "command": "node",
-      "args": [
-        "D:\\Projects\\mcp-thought-server\\build\\index.js"
-      ],
-      "env": {}
+      "args": ["D:\\Projects\\mcp-thought-server\\build\\index.js"],
+      "env": {},
+      "autoRestart": true
     },
-    "file-ops": { 
+    "file-ops": {
       "command": "node",
-      "args": [
-        "D:/Projects/mcp-servers/Cline/MCP/file-operations-server/build/index.js"
-      ]
+      "args": ["D:/Projects/mcp-servers/Cline/MCP/file-operations-server/build/index.js"]
     }
-    // Add entries for other MCP servers here...
+    // Add entries for other managed MCP servers here...
+  },
+  "hubTools": {
+    "example": {
+      "description": "An example tool provided by the hub itself.",
+      "modulePath": "./exampleHubTool.js", // Path relative to dist/tools/
+      "handlerExport": "default", // Optional, defaults to 'default'
+      "enabled": true // Optional, defaults to true
+    }
+    // Add entries for other hub-native tools here...
+  },
+  "exampleService": {
+    "featureFlag": false,
+    "messagePrefix": "INITIAL"
+    // Add other settings specific to ExampleConfigurableService
   },
   "settings": {
     "logLevel": "info", // Optional: 'error', 'warn', 'info', 'debug'
-    "wsPort": 8081,     // Port for Gateway Clients to connect to
-    "ssePort": null     // SSE interface is disabled by default
+    "wsPort": 8081,     // Port for Gateway Clients (WebSocket)
+    "ssePort": null     // SSE interface port (null to disable)
   }
 }
 ```
 
-**Key Configuration Fields:**
+**Key Configuration Sections:**
 
-* `mcpServers`: An object where each key is a unique `serverId` you choose (e.g., `thought-server`, `file-ops`). This ID is used for namespacing tools.
-  * `command`: The executable command to start the server.
-  * `args`: An array of string arguments.
-  * `env` (Optional): Environment variables for the server process.
-  * `workingDir` (Optional): Working directory for the server process.
-  * `autoRestart` (Optional): `true` or `false` (default).
-  * `maxRestarts` (Optional): Max restart attempts (default: 3).
-* `settings`: Gateway Server specific settings.
-  * `wsPort`: TCP port the Gateway Server listens on for WebSocket connections.
-  * `logLevel`: Logging verbosity for Gateway Server and Client.
+* `mcpServers`: Defines external MCP servers managed by the hub.
+  * Key: A unique `serverId` (used for tool namespacing, e.g., `thought-server`).
+  * `command`, `args`, `env`, `workingDir`, `autoRestart`, `maxRestarts`: Standard process configuration.
+* `hubTools`: Defines tools implemented directly within this hub project (in `src/tools/`).
+  * Key: The base name for the tool (e.g., `example`).
+  * `description`: Tool description.
+  * `modulePath`: Path to the compiled JS file (relative to `dist/tools/`).
+  * `handlerExport` (Optional): Named export containing the tool handler function (defaults to `default`). The module should also export an `inputSchema` (Zod schema).
+  * `enabled` (Optional): `true` or `false` (default: `true`).
+* `exampleService`: Configuration specific to the `ExampleConfigurableService`. Add sections here for other configurable hub services.
+* `settings`: General gateway settings.
+  * `wsPort`: Port for the WebSocket interface used by the `gateway-client`.
+  * `logLevel`: Logging verbosity.
+  * `ssePort`: Port for the Server-Sent Events interface (if enabled).
+
+**Dynamic Reloading:** Changes saved to `dist/mcp_hub_config.json` while the server is running will be automatically detected and applied.
+
+* Changes in `mcpServers` will cause the corresponding server process to be stopped/started/restarted.
+* Changes in `hubTools` will load/unload/reload the specified tool modules.
+* Changes in `settings` or service-specific sections (like `exampleService`) will trigger events that relevant components listen for.
 
 ### 4. Running the Gateway Server
 
 Open a terminal in the project root directory (`mcp-server-hub-server`) and run:
 
 ```bash
+# Ensure you have built the project first!
+npm run build
+
+# Start the server
 npm start
 ```
 
-This will read `dist/mcp_hub_config.json`, start the managed servers, start the WebSocket listener, and keep running until manually stopped (Ctrl+C).
+This reads `dist/mcp_hub_config.json`, starts managed servers, loads hub tools, starts the WebSocket listener, watches the config file, and keeps running until manually stopped (Ctrl+C).
 
 ### 5. Configuring Your LLM Client (e.g., Cline)
 
@@ -150,15 +178,18 @@ Add the following entry to your client's MCP server settings file (e.g., Cline's
       "command": "node",
       "args": [
         // Use the FULL, absolute path to the compiled client script
-        "d:/Projects/mcp-server-hub-server/dist/client/client.js" 
+        "d:/Projects/mcp-server-hub-server/dist/client/client.js"
       ],
       "options": {
         // CWD should be the project root
         "cwd": "d:/Projects/mcp-server-hub-server"
       },
-      "env": {},
+      "env": {
+        // Optional: Configure client polling interval (default is 5 minutes)
+        // "CLIENT_TOOL_REFRESH_INTERVAL_MS": "60000" // e.g., 60 seconds
+      },
       "disabled": false,
-      "autoApprove": [] 
+      "autoApprove": []
     }
     // Only the gateway-client entry is needed here
   }
@@ -171,18 +202,23 @@ When the LLM client connects to `gateway-client`, it will automatically start th
 
 Once the Gateway Server is running and your LLM Client is connected to the `gateway-client`:
 
-* List tools in your LLM Client. You should see namespaced tool names like `thought-server__integratedThinking`, `file-ops__list_directory`, etc. The namespacing (`serverId__toolName`) prevents conflicts between tools from different servers that might share the same original name.
+* List tools in your LLM Client. You should see namespaced tool names:
+  * Managed server tools: `serverId__toolName` (e.g., `thought-server__integratedThinking`)
+  * Hub-native tools: `hub__toolName` (e.g., `hub__example`)
 * Call tools using these full, namespaced names.
+* **Note:** Due to dynamic configuration, the tool list might change over time. The `gateway-client` polls for updates periodically (default 5 minutes, configurable via `CLIENT_TOOL_REFRESH_INTERVAL_MS` env var for the client process). There might be a short delay between a server-side change and the client becoming aware of it. See `docs/client-dynamic-tools-guide.md` for details.
 
 ## Troubleshooting
 
 * **ENOENT Error Starting `gateway-client` in LLM Client:** Ensure the `command` (`node`), `args` (absolute path to `dist/client/client.js`), and `options.cwd` (absolute path to project root) in the LLM Client's MCP settings are correct for your system.
-* **Tool Name Validation Error (`String should match pattern...`):** This indicates an invalid character or length in a tool name reported to the LLM client. This gateway uses `serverId__toolName` which should be valid. Ensure your `serverId` keys in `mcp_hub_config.json` only contain `a-zA-Z0-9_-`. The gateway attempts to truncate long server IDs to keep the total length <= 60 characters.
-* **Gateway Client Cannot Connect to Server:** Verify the Gateway Server (`npm start`) is running. Check the `wsPort` in `dist/mcp_hub_config.json` matches the URL in `src/client/client.ts` (default `ws://localhost:8081`). Check firewalls.
-* **Cline Initial `listTools` Fails/Times Out:** This is a known caveat. Cline sometimes sends its first `listTools` request *immediately* upon starting the `gateway-client`, potentially before the client has finished connecting to the Gateway Server's WebSocket. The client queues the request to prevent errors, but Cline might display a timeout initially. Subsequent `listTools` calls or other tool calls should work correctly once the connection is established (usually within milliseconds). Check the Gateway Client logs (`npm run start:client` terminal) for messages about queueing.
+* **Tool Name Validation Error (`String should match pattern...`):** Ensure your `serverId` keys and `hubTools` keys in `mcp_hub_config.json` only contain `a-zA-Z0-9_-`.
+* **Gateway Client Cannot Connect to Server:** Verify the Gateway Server (`npm start`) is running. Check the `wsPort` in `dist/mcp_hub_config.json` matches the URL used by the client (default `ws://localhost:8081`). Check firewalls.
+* **Initial `listTools` Fails/Times Out in LLM Client:** This can happen if the LLM client sends the request before the `gateway-client` process fully connects to the Gateway Server's WebSocket. The client queues the request, and subsequent calls should work. Check the Gateway Client logs for queueing messages (you might need to run `node dist/client/client.js` manually in a separate terminal to see its logs).
 * **Managed Server Errors (`[serverId/ERR]`):** Errors logged with a specific server ID prefix indicate problems within that underlying managed server, not the Gateway itself. Troubleshoot that server directly.
+* **Dynamic Config Not Reloading:** Ensure you are modifying `dist/mcp_hub_config.json` while the server is running. Check the Gateway Server logs for file watcher messages and potential validation errors upon reload. Ensure the build process successfully copied your intended config from the root to `dist/`.
 
 ## Development
 
-* **Run Dev Server:** `npm run dev` (uses nodemon for auto-restart of the Gateway Server). Does not restart the client or managed servers.
+* **Run Dev Server:** `npm run dev` (uses nodemon for auto-restart of the Gateway Server on `src` changes). Note: This does *not* automatically rebuild/copy the config or restart the client/managed servers. You'll need to run `npm run build` and restart manually for config/client changes.
 * **Linting/Formatting:** `npm run lint`, `npm run format` (also run via pre-commit hook).
+* **Testing:** `npm test` (currently limited, see `tests/`).

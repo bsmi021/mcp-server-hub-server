@@ -2,6 +2,7 @@ import { EventEmitter } from 'events';
 import { Client, ClientOptions } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport, StdioServerParameters } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { z } from 'zod'; // Import Zod
+import { zodToJsonSchema } from 'zod-to-json-schema'; // Import the converter
 // Import necessary MCP types for request/response
 import {
     ListToolsResult,
@@ -15,9 +16,10 @@ import { ServerInstance, ServerStatus } from '../types/serverTypes.js';
 import { ToolDefinition, ToolsChangedListener } from '../types/toolTypes.js';
 import { ConfigurationManager } from '../config/ConfigurationManager.js'; // Import ConfigManager
 import { Config, HubToolConfig } from '../types/configTypes.js'; // Import Config types
+// Import specific event types and names
+import { ConfigEvents, HubToolAddedPayload, HubToolRemovedPayload, HubToolUpdatedPayload } from '../types/eventTypes.js';
 import { logger } from '../utils/logger.js';
 import * as path from 'path'; // Needed for dynamic imports
-import { zodToJsonSchema } from 'zod-to-json-schema'; // Import the converter
 
 // Timeout for connecting to a server and listing/calling tools
 const DISCOVERY_TIMEOUT_MS = 10000; // 10 seconds
@@ -46,36 +48,15 @@ export class ToolRegistry extends EventEmitter {
         // Listen for server status changes to discover/remove server tools
         this.serverManager.onServerStatusChange(this.handleServerStatusChange.bind(this));
 
-        // Listen for config changes to update hub tools
-        this.configManager.on('configChanged', this.handleConfigChange.bind(this));
+        // Listen for specific hub tool config change events
+        this.configManager.on(ConfigEvents.HUB_TOOL_ADDED, this.handleHubToolAdded.bind(this));
+        this.configManager.on(ConfigEvents.HUB_TOOL_REMOVED, this.handleHubToolRemoved.bind(this));
+        this.configManager.on(ConfigEvents.HUB_TOOL_UPDATED, this.handleHubToolUpdated.bind(this));
+        // We might also need to listen to SETTINGS_UPDATED if hub tools depend on global settings
 
-        // Process initial hub tools config after ensuring config is loaded
-        // We rely on the main server initialization sequence to call loadConfig first.
-        // A slight delay might occur if config loads after registry construction,
-        // but handleConfigChange will eventually sync it.
-        // Alternatively, pass the initial config here if available.
-        const initialConfig = this.configManager.getCurrentConfig(); // Use the new getter
-        if (initialConfig) {
-            this.processHubToolsConfig(initialConfig);
-        } else {
-            logger.warn('Initial config not available during ToolRegistry construction. Hub tools will be processed on first config change.');
-        }
-
-        logger.info('ToolRegistry initialized and listening to ServerManager and ConfigurationManager.');
+        // Initial population relies on ConfigManager emitting initial state events (SERVER_ADDED, HUB_TOOL_ADDED)
+        logger.info('ToolRegistry initialized and listening to ServerManager and ConfigurationManager events.');
     }
-
-    /**
-    * Handles configuration changes from the ConfigurationManager.
-    * Specifically processes changes to the 'hubTools' section.
-    */
-    private handleConfigChange({ newConfig }: { newConfig: Config }): void {
-        logger.info('Configuration changed, reprocessing hub tools...');
-        // Use Promise.resolve to handle async operation without awaiting here
-        Promise.resolve(this.processHubToolsConfig(newConfig)).catch(err => {
-            logger.error(`Error processing hub tools config change: ${err.message}`);
-        });
-    }
-
 
     /**
      * Handles status changes from the ServerManager. Triggers tool discovery
@@ -180,83 +161,104 @@ export class ToolRegistry extends EventEmitter {
         this.emitToolsChanged();
     }
 
-    // --- Hub Tool Management ---
+    // --- Hub Tool Event Handlers ---
 
     /**
-     * Processes the hubTools section of the configuration, loading, unloading,
-     * or updating tools as necessary.
-     * @param config - The current hub configuration.
+     * Handles HUB_TOOL_ADDED event.
      */
-    private async processHubToolsConfig(config: Config | null): Promise<void> {
-        if (!config) return;
+    private async handleHubToolAdded(payload: HubToolAddedPayload): Promise<void> {
+        const { toolName, gatewayToolName, config } = payload;
+        const existingTool = this.tools.get(gatewayToolName);
 
-        const hubToolsConfig = config.hubTools || {};
-        const currentHubToolNames = new Set<string>();
-        let registryChanged = false;
-
-        // Use Promise.all to handle async loading concurrently
-        const processingPromises = Object.entries(hubToolsConfig).map(async ([toolName, toolConfig]) => {
-            const gatewayToolName = this.generateHubGatewayToolName(toolName);
-            currentHubToolNames.add(gatewayToolName);
-            const existingTool = this.tools.get(gatewayToolName);
-
-            if (toolConfig.enabled) {
-                let needsLoad = false;
-                if (!existingTool || !existingTool.isHubTool) {
-                    needsLoad = true; // New or replacing server tool
-                } else if (
-                    existingTool.modulePath !== toolConfig.modulePath ||
-                    existingTool.handlerExport !== toolConfig.handlerExport ||
-                    existingTool.description !== toolConfig.description ||
-                    !existingTool.enabled // Was previously disabled
-                ) {
-                    logger.info(`Hub tool "${toolName}" configuration changed, attempting reload...`);
-                    this.unloadHubTool(gatewayToolName); // Unload old first
-                    needsLoad = true;
-                } else if (!existingTool.enabled) { // Only enabled status changed
-                    existingTool.enabled = true;
-                    logger.info(`Hub tool "${toolName}" (${gatewayToolName}) re-enabled.`);
-                    registryChanged = true; // Mark change
-                }
-
-                if (needsLoad) {
-                    if (await this.loadAndRegisterHubTool(toolName, gatewayToolName, toolConfig)) {
-                        registryChanged = true; // Mark change
-                    }
-                }
-            } else { // Tool is configured but disabled
-                if (existingTool?.isHubTool && existingTool.enabled) {
-                    existingTool.enabled = false;
-                    // Consider unloading module here if desired: this.unloadHubTool(gatewayToolName);
-                    logger.info(`Hub tool "${toolName}" (${gatewayToolName}) disabled via configuration.`);
-                    registryChanged = true; // Mark change
-                } else if (existingTool && !existingTool.isHubTool) {
-                    logger.warn(`Hub tool config for "${toolName}" is disabled, but a conflicting tool from server "${existingTool.serverId}" exists. Server tool remains active.`);
-                }
-            }
-        });
-
-        await Promise.all(processingPromises);
-
-        // Unload hub tools that are no longer in the configuration
-        const toolsToRemove: string[] = [];
-        for (const [gatewayToolName, toolDef] of this.tools.entries()) {
-            if (toolDef.isHubTool && !currentHubToolNames.has(gatewayToolName)) {
-                toolsToRemove.push(gatewayToolName);
-                registryChanged = true; // Mark change
+        if (existingTool) {
+            const conflictSource = existingTool.isHubTool ? 'hub (already added?)' : `server "${existingTool.serverId}"`;
+            logger.warn(`Hub tool add conflict: "${gatewayToolName}" conflicts with existing tool from ${conflictSource}. Overwriting.`);
+            if (existingTool.isHubTool) {
+                this.unloadHubTool(gatewayToolName); // Unload previous hub tool if overwriting
             }
         }
-        toolsToRemove.forEach(gatewayToolName => {
-            const toolName = this.tools.get(gatewayToolName)?.name;
-            this.unloadHubTool(gatewayToolName);
-            this.tools.delete(gatewayToolName); // Remove from registry
-            logger.info(`Unloaded and removed hub tool "${toolName}" (${gatewayToolName}) as it was removed from config.`);
-        });
 
-        if (registryChanged) {
-            this.emitToolsChanged();
+        if (config.enabled) {
+            logger.info(`Hub tool "${toolName}" added via config. Loading...`);
+            if (await this.loadAndRegisterHubTool(toolName, gatewayToolName, config)) {
+                this.emitToolsChanged();
+            }
+        } else {
+            logger.info(`Hub tool "${toolName}" added via config but is disabled. Not loading.`);
+            // Optionally register as disabled? For now, only active tools are in the map.
         }
     }
+
+    /**
+     * Handles HUB_TOOL_REMOVED event.
+     */
+    private handleHubToolRemoved(payload: HubToolRemovedPayload): void {
+        const { toolName, gatewayToolName } = payload;
+        const existingTool = this.tools.get(gatewayToolName);
+
+        if (existingTool?.isHubTool) {
+            logger.info(`Hub tool "${toolName}" removed via config. Unloading...`);
+            this.unloadHubTool(gatewayToolName);
+            this.tools.delete(gatewayToolName);
+            this.emitToolsChanged();
+        } else if (existingTool) {
+            logger.warn(`Received HUB_TOOL_REMOVED for "${gatewayToolName}", but it's a server tool from "${existingTool.serverId}". Ignoring.`);
+        } else {
+            logger.warn(`Received HUB_TOOL_REMOVED for non-existent tool "${gatewayToolName}". Ignoring.`);
+        }
+    }
+
+    /**
+     * Handles HUB_TOOL_UPDATED event.
+     */
+    private async handleHubToolUpdated(payload: HubToolUpdatedPayload): Promise<void> {
+        const { toolName, gatewayToolName, newConfig, oldConfig } = payload;
+        const existingTool = this.tools.get(gatewayToolName);
+
+        if (!existingTool || !existingTool.isHubTool) {
+            logger.warn(`Received HUB_TOOL_UPDATED for non-hub tool or non-existent tool "${gatewayToolName}". Handling as ADD if enabled.`);
+            // Treat as an add if it's now enabled
+            if (newConfig.enabled) {
+                await this.handleHubToolAdded({ toolName, gatewayToolName, config: newConfig });
+            }
+            return;
+        }
+
+        // Check if only enabled status changed
+        if (newConfig.enabled !== oldConfig.enabled) {
+            existingTool.enabled = newConfig.enabled;
+            if (newConfig.enabled) {
+                logger.info(`Hub tool "${toolName}" (${gatewayToolName}) re-enabled.`);
+                // If it wasn't loaded before (e.g., added as disabled), load it now.
+                if (!existingTool.handler) {
+                    logger.info(`Loading previously disabled hub tool "${toolName}"...`);
+                    await this.loadAndRegisterHubTool(toolName, gatewayToolName, newConfig); // This will overwrite existingTool def
+                }
+            } else {
+                logger.info(`Hub tool "${toolName}" (${gatewayToolName}) disabled via configuration.`);
+                // Optionally unload module when disabled: this.unloadHubTool(gatewayToolName);
+            }
+            this.emitToolsChanged();
+            // If other properties also changed, they'll be handled below if the tool remains enabled.
+        }
+
+        // If enabled and other properties changed, reload the tool
+        if (newConfig.enabled && (
+            newConfig.modulePath !== oldConfig.modulePath ||
+            newConfig.handlerExport !== oldConfig.handlerExport ||
+            newConfig.description !== oldConfig.description
+            // Add other relevant property comparisons here if HubToolConfig expands
+        )) {
+            logger.info(`Hub tool "${toolName}" configuration changed (module/handler/desc). Reloading...`);
+            this.unloadHubTool(gatewayToolName); // Unload old
+            if (await this.loadAndRegisterHubTool(toolName, gatewayToolName, newConfig)) { // Load new
+                this.emitToolsChanged();
+            }
+        } else if (newConfig.enabled) {
+            logger.debug(`Hub tool "${toolName}" updated, but only 'enabled' status or irrelevant properties changed. No reload needed.`);
+        }
+    }
+
 
     /**
      * Dynamically loads a hub tool module and registers the tool.
@@ -267,17 +269,20 @@ export class ToolRegistry extends EventEmitter {
      */
     private async loadAndRegisterHubTool(toolName: string, gatewayToolName: string, toolConfig: HubToolConfig): Promise<boolean> {
         // Resolve module path relative to project root (where node runs from) or dist folder
-        const moduleFullPath = path.resolve(process.cwd(), 'dist', 'tools', toolConfig.modulePath);
-        logger.debug(`Attempting to load hub tool module: ${moduleFullPath}`);
+        const resolvedPath = path.resolve(process.cwd(), 'dist', 'tools', toolConfig.modulePath);
+        // Convert to file:// URL for ESM import compatibility, especially on Windows
+        const moduleFileUrl = `file://${resolvedPath.replace(/\\/g, '/')}`;
+        logger.debug(`Attempting to load hub tool module from URL: ${moduleFileUrl}`);
+
 
         try {
-            // Cache busting for dynamic import
-            const moduleWithCacheBust = `${moduleFullPath}?t=${Date.now()}`;
+            // Cache busting for dynamic import - append to the file URL
+            const moduleWithCacheBust = `${moduleFileUrl}?t=${Date.now()}`;
             const toolModule = await import(moduleWithCacheBust);
             const handler = toolModule[toolConfig.handlerExport || 'default'];
 
             if (typeof handler !== 'function') {
-                throw new Error(`Handler export "${toolConfig.handlerExport || 'default'}" not found or not a function in module ${moduleFullPath}`);
+                throw new Error(`Handler export "${toolConfig.handlerExport || 'default'}" not found or not a function in module ${moduleFileUrl}`);
             }
 
             // Convention: Assume module exports 'inputSchema' (a Zod schema)
@@ -295,16 +300,16 @@ export class ToolRegistry extends EventEmitter {
                 handler: handler,
                 modulePath: toolConfig.modulePath,
                 handlerExport: toolConfig.handlerExport,
-                enabled: true,
+                enabled: true, // If loaded, it's enabled
             };
 
             this.tools.set(gatewayToolName, toolDefinition);
-            this.hubToolModules.set(gatewayToolName, toolModule);
+            this.hubToolModules.set(gatewayToolName, toolModule); // Store loaded module if needed for cleanup
             logger.info(`Successfully loaded and registered hub tool: ${gatewayToolName}`);
             return true;
 
         } catch (error: any) {
-            logger.error(`Failed to load hub tool "${toolName}" from ${moduleFullPath}: ${error.message}`);
+            logger.error(`Failed to load hub tool "${toolName}" from ${moduleFileUrl}: ${error.message}`);
             if (this.tools.has(gatewayToolName)) {
                 this.tools.delete(gatewayToolName);
             }
@@ -322,9 +327,10 @@ export class ToolRegistry extends EventEmitter {
         if (toolDef?.isHubTool) {
             logger.debug(`Unloading hub tool: ${gatewayToolName}`);
             this.hubToolModules.delete(gatewayToolName);
-            // The tool definition itself is removed by the caller (processHubToolsConfig)
+            // The tool definition itself is removed by the caller (handleHubToolRemoved or handleHubToolUpdated)
         }
     }
+
 
     // --- Tool Name Generation ---
 

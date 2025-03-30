@@ -4,6 +4,7 @@ import { ConfigurationManager } from '../config/ConfigurationManager.js';
 import { Config, ServerConfig } from '../types/configTypes.js'; // Import Config
 import { ServerInstance, ServerStatus, ServerStatusChangeListener } from '../types/serverTypes.js';
 import { logger } from '../utils/logger.js';
+import { ConfigEvents, ServerAddedPayload, ServerRemovedPayload, ServerUpdatedPayload } from '../types/eventTypes.js'; // Import event types
 
 // Constants for restart logic
 const RESTART_DELAY_MS = 5000; // Delay before attempting a restart
@@ -21,98 +22,99 @@ export class ServerManager extends EventEmitter {
     constructor(configManager: ConfigurationManager) {
         super();
         this.configManager = configManager;
-        // Listen for configuration changes to add/remove servers
-        this.configManager.on('configChanged', this.handleConfigChange.bind(this));
-        logger.info('ServerManager initialized and listening to ConfigurationManager.');
+        // Listen for specific configuration change events
+        this.configManager.on(ConfigEvents.SERVER_ADDED, this.handleServerAdded.bind(this));
+        this.configManager.on(ConfigEvents.SERVER_REMOVED, this.handleServerRemoved.bind(this));
+        this.configManager.on(ConfigEvents.SERVER_UPDATED, this.handleServerUpdated.bind(this));
+        logger.info('ServerManager initialized and listening to ConfigurationManager events.');
         // Note: Initial server loading still happens via initializeServers() called externally
+        // which now relies on the initial SERVER_ADDED events from ConfigManager.
     }
 
     /**
-     * Handles configuration changes relevant to managed servers.
-     * Starts new servers and stops removed servers.
-     * @param newConfig - The newly loaded configuration object.
+     * Handles the SERVER_ADDED event from ConfigurationManager.
      */
-    private handleConfigChange({ newConfig }: { newConfig: Config }): void {
-        logger.info('ServerManager detected configuration change. Reconciling server instances...');
-        const newServerConfigs = newConfig.mcpServers || {};
-        const newServerIds = new Set(Object.keys(newServerConfigs));
-        const currentServerIds = new Set(this.servers.keys());
-
-        // Servers to start (in new config but not current)
-        for (const serverId of newServerIds) {
-            if (!currentServerIds.has(serverId)) {
-                const serverConfig = newServerConfigs[serverId];
-                // Ensure defaults are applied if needed (ConfigManager processConfig should handle this)
-                const instance: ServerInstance = {
-                    id: serverId,
-                    config: serverConfig as Required<ServerConfig>, // Assume processed config
-                    status: 'stopped',
-                    process: null,
-                    lastExitCode: null,
-                    lastExitSignal: null,
-                    restartAttempts: 0,
-                };
-                this.servers.set(serverId, instance);
-                logger.info(`New server "${serverId}" detected in config. Initializing and attempting start...`);
-                this.spawnServer(serverId).catch(err => {
-                    logger.error(`Failed to auto-start new server "${serverId}" after config change: ${err.message}`);
-                });
-            } else {
-                // Server exists in both old and new config, check if config changed
-                const instance = this.servers.get(serverId);
-                const newServerConfig = newServerConfigs[serverId];
-                if (instance && JSON.stringify(instance.config) !== JSON.stringify(newServerConfig)) {
-                    logger.info(`Configuration change detected for existing server "${serverId}". Restarting...`);
-                    // Stop the current instance first, then spawn with new config
-                    this.stopServer(serverId).then(() => {
-                        // Update the stored config before spawning
-                        instance.config = newServerConfig as Required<ServerConfig>;
-                        instance.restartAttempts = 0; // Reset restarts on config-triggered restart
-                        logger.info(`Attempting to spawn server "${serverId}" with updated configuration...`);
-                        return this.spawnServer(serverId);
-                    }).catch(err => {
-                        logger.error(`Failed to restart server "${serverId}" after config update: ${err.message}`);
-                        // Instance might be left in a stopped/error state
-                    });
-                }
-            }
+    private handleServerAdded(payload: ServerAddedPayload): void {
+        const { serverId, config } = payload;
+        if (this.servers.has(serverId)) {
+            logger.warn(`Received SERVER_ADDED for existing server ID "${serverId}". Ignoring.`);
+            return;
         }
-
-        // Servers to stop (in current but not new config)
-        for (const serverId of currentServerIds) {
-            if (!newServerIds.has(serverId)) {
-                logger.info(`Server "${serverId}" removed from config. Stopping...`);
-                this.stopServer(serverId).catch(err => {
-                    logger.error(`Failed to stop removed server "${serverId}" after config change: ${err.message}`);
-                });
-                // Remove from internal map AFTER initiating stop to avoid race conditions with status updates
-                // Let the stopServer logic handle the final removal or status update.
-                // Consider if immediate removal is better: this.servers.delete(serverId);
-            }
-        }
+        logger.info(`Server "${serverId}" added via config. Initializing and attempting start...`);
+        const instance: ServerInstance = {
+            id: serverId,
+            config: config, // Config is already processed and Required<ServerConfig>
+            status: 'stopped',
+            process: null,
+            lastExitCode: null,
+            lastExitSignal: null,
+            restartAttempts: 0,
+        };
+        this.servers.set(serverId, instance);
+        this.spawnServer(serverId).catch(err => {
+            logger.error(`Failed to auto-start added server "${serverId}": ${err.message}`);
+        });
     }
 
     /**
-     * Initializes the ServerManager by creating ServerInstance objects for each configured server.
-     * Does not start the processes yet.
+     * Handles the SERVER_REMOVED event from ConfigurationManager.
+     */
+    private handleServerRemoved(payload: ServerRemovedPayload): void {
+        const { serverId } = payload;
+        if (!this.servers.has(serverId)) {
+            logger.warn(`Received SERVER_REMOVED for non-managed server ID "${serverId}". Ignoring.`);
+            return;
+        }
+        logger.info(`Server "${serverId}" removed via config. Stopping...`);
+        this.stopServer(serverId).then(() => {
+            // Remove from map only after successful stop confirmation (or timeout)
+            this.servers.delete(serverId);
+            logger.debug(`Removed server instance "${serverId}" from map after stopping.`);
+        }).catch(err => {
+            logger.error(`Failed to stop removed server "${serverId}": ${err.message}`);
+            // Consider if we should still remove from map on error? Maybe not.
+            // If stop fails, it might still be running or in an error state.
+            // Let's keep it in the map but likely in 'error' or 'stopping' state.
+        });
+    }
+
+    /**
+     * Handles the SERVER_UPDATED event from ConfigurationManager.
+     */
+    private handleServerUpdated(payload: ServerUpdatedPayload): void {
+        const { serverId, newConfig, oldConfig } = payload;
+        const instance = this.servers.get(serverId);
+        if (!instance) {
+            logger.warn(`Received SERVER_UPDATED for non-managed server ID "${serverId}". Ignoring.`);
+            return;
+        }
+        logger.info(`Configuration updated for server "${serverId}". Restarting with new config...`);
+        // Stop the current instance first, then spawn with new config
+        this.stopServer(serverId).then(() => {
+            // Update the stored config before spawning
+            instance.config = newConfig; // newConfig is already Required<ServerConfig>
+            instance.restartAttempts = 0; // Reset restarts on config-triggered restart
+            logger.info(`Attempting to spawn server "${serverId}" with updated configuration...`);
+            return this.spawnServer(serverId);
+        }).catch(err => {
+            logger.error(`Failed to restart server "${serverId}" after config update: ${err.message}`);
+            // Instance might be left in a stopped/error state
+            this.updateStatus(serverId, 'error'); // Ensure status reflects the failure
+        });
+    }
+
+    /**
+     * Initializes the ServerManager based on the *initial* configuration.
+     * This is less critical now as `handleServerAdded` handles initial population.
+     * Kept for potential direct use or clarity, but could be removed if startup relies solely on events.
      */
     public initializeServers(): void {
-        const serverConfigs = this.configManager.getAllServerConfigs();
-        this.servers.clear(); // Clear any previous state
-
-        for (const serverId in serverConfigs) {
-            const config = serverConfigs[serverId] as Required<ServerConfig>; // Cast as Required because defaults are applied
-            this.servers.set(serverId, {
-                id: serverId,
-                config: config,
-                status: 'stopped',
-                process: null,
-                lastExitCode: null,
-                lastExitSignal: null,
-                restartAttempts: 0,
-            });
-            logger.debug(`Initialized server instance for: ${serverId}`);
-        }
+        // This method might become redundant if the initial config load
+        // reliably emits SERVER_ADDED events for all initial servers.
+        // Let's keep it for now but acknowledge its role might diminish.
+        logger.debug("initializeServers called. Relying on initial SERVER_ADDED events.");
+        this.servers.clear(); // Start fresh if called explicitly
+        // The actual instances will be created by handleServerAdded events.
     }
 
     /**
